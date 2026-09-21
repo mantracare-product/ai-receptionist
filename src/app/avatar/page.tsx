@@ -2,6 +2,6 @@
 
 import { AvatarReceptionView } from "@/reception/avatar/AvatarReceptionView";
 
-export default function HomePage() {
+export default function AvatarPage() {
   return <AvatarReceptionView />;
 }
