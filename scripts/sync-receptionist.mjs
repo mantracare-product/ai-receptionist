@@ -68,6 +68,9 @@ export function syncAll() {
   // 1. Sync src/reception/ -> src/reception/
   const srcReception = path.join(SOURCE_ROOT, "src/reception");
   const targetReception = path.join(TARGET_ROOT, "src/reception");
+  if (fs.existsSync(targetReception)) {
+    fs.rmSync(targetReception, { recursive: true, force: true });
+  }
   copyDirRecursive(srcReception, targetReception, transformCode);
   console.log(`[Synced] src/reception/ directory`);
 
