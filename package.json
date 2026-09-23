@@ -11,6 +11,7 @@
     "sync:watch": "node scripts/sync-receptionist.mjs --watch"
   },
   "dependencies": {
+    "@xenova/transformers": "^2.17.2",
     "canvas-confetti": "^1.9.4",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -19,7 +20,8 @@
     "react": "19.2.8",
     "react-dom": "19.2.8",
     "sonner": "^2.0.8",
-    "tailwind-merge": "^3.7.0"
+    "tailwind-merge": "^3.7.0",
+    "wavefile": "^11.0.0"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",

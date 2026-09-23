@@ -58,6 +58,7 @@ function transformCode(code, filePath) {
   res = res.replace(/from\s+["']\.\.\/components\/ui\/Tooltip["']/g, 'from "@/components/ui/Tooltip"');
   res = res.replace(/from\s+["']\.\.\/components\/layout\/PageHeader["']/g, 'from "@/components/layout/PageHeader"');
   res = res.replace(/from\s+["'](?:\.\.\/)+reception\/(.*?)["']/g, 'from "@/reception/$1"');
+  res = res.replace(/from\s+['"]react-router['"]/g, 'from "@/lib/routerShim"');
 
   return res;
 }
@@ -111,7 +112,16 @@ export function syncAll() {
     fs.writeFileSync(targetVisitJourney, transformCode(fs.readFileSync(srcVisitJourney, "utf-8"), srcVisitJourney), "utf-8");
   }
 
-  // 5. Sync Documentation
+  // 5. Sync Whisper STT server module
+  const srcWhisperStt = path.join(SOURCE_ROOT, "server/routes/whisperStt.ts");
+  const targetWhisperStt = path.join(TARGET_ROOT, "src/server/whisperStt.ts");
+  if (fs.existsSync(srcWhisperStt)) {
+    fs.mkdirSync(path.dirname(targetWhisperStt), { recursive: true });
+    fs.copyFileSync(srcWhisperStt, targetWhisperStt);
+    console.log(`[Synced] server/routes/whisperStt.ts -> src/server/whisperStt.ts`);
+  }
+
+  // 6. Sync Documentation
   const docs = ["AI_RECEPTIONIST_DESIGN.md", "AI_RECEPTIONIST_PRD.md", "BACKEND_HANDOFF_SPEC.md", "DESIGN_NAVODYA.md"];
   for (const doc of docs) {
     const docSrc = path.join(SOURCE_ROOT, doc);
