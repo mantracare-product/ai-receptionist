@@ -49,6 +49,9 @@ export interface IMaClient {
   checkinWalkIn(payload: {
     patient: { name: string; phone: string; dob?: string };
     reason?: string;
+    providerId?: string;
+    serviceId?: string;
+    responsible?: string;
     processId?: string;
     idempotencyKey?: string;
   }): Promise<{ success: boolean; ticket: QueueTicket; journey: Journey }>;

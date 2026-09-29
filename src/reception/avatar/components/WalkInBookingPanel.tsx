@@ -226,6 +226,9 @@ export const WalkInBookingPanel: React.FC<WalkInBookingPanelProps> = ({
     try {
       // 1. Create or match client in MantraAssist
       let clientId = existingPatient?.id;
+      const chosenDoc = providers.find((p) => String(p.id) === selectedProviderId);
+      const responsibleDoc = chosenDoc ? chosenDoc.name.replace(/^Dr\.\s*/i, '') : undefined;
+
       if (!clientId) {
         const newClient = await maClient.createWalkInClient(
           {
@@ -234,6 +237,8 @@ export const WalkInBookingPanel: React.FC<WalkInBookingPanelProps> = ({
             age: patientAge,
             gender: patientGender,
             reason: visitReason,
+            providerId: selectedProviderId !== 'next_available' ? selectedProviderId : undefined,
+            responsible: responsibleDoc,
           },
           sessionToken
         );
@@ -248,13 +253,16 @@ export const WalkInBookingPanel: React.FC<WalkInBookingPanelProps> = ({
           phone: phoneNumber,
         },
         reason: visitReason,
+        providerId: selectedProviderId !== 'next_available' ? selectedProviderId : undefined,
+        serviceId: selectedServiceId,
+        responsible: responsibleDoc,
         idempotencyKey,
       });
 
       setIssuedTicket(walkinResult.ticket);
       setCurrentStep('TOKEN_ISSUED');
 
-      const roomName = walkinResult.ticket.stationName || 'Room 101 - Dr. Sharma';
+      const roomName = walkinResult.ticket.stationName || 'Doctor Consultation Room';
       onStepChange(
         'TOKEN_ISSUED',
         `Walk-in registration complete! Your queue token is ${walkinResult.ticket.tokenLabel}. Please proceed to ${roomName}.`
@@ -755,26 +763,34 @@ export const WalkInBookingPanel: React.FC<WalkInBookingPanelProps> = ({
                 )}
               </button>
 
-              <button
-                type="button"
-                onClick={() => {
-                  onActivity();
-                  setSelectedProviderId('prov_1');
-                }}
-                className={`p-3 rounded-xl text-left text-xs font-bold border transition-all flex items-center justify-between ${
-                  selectedProviderId === 'prov_1'
-                    ? 'bg-blue-950/60 border-blue-500 text-blue-300 shadow-sm'
-                    : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
-                }`}
-              >
-                <div>
-                  <div className="text-white">Dr. Ananya Sharma</div>
-                  <div className="text-[10px] text-slate-400 font-normal">Room 101 • General Physician</div>
-                </div>
-                {selectedProviderId === 'prov_1' && (
-                  <CheckCircle2 className="w-4 h-4 text-blue-400" />
-                )}
-              </button>
+              {providers.map((prov) => {
+                const isSelected = selectedProviderId === String(prov.id);
+                return (
+                  <button
+                    key={prov.id}
+                    type="button"
+                    onClick={() => {
+                      onActivity();
+                      setSelectedProviderId(String(prov.id));
+                    }}
+                    className={`p-3 rounded-xl text-left text-xs font-bold border transition-all flex items-center justify-between ${
+                      isSelected
+                        ? 'bg-blue-950/60 border-blue-500 text-blue-300 shadow-sm'
+                        : 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800'
+                    }`}
+                  >
+                    <div>
+                      <div className="text-white">{prov.name}</div>
+                      <div className="text-[10px] text-slate-400 font-normal">
+                        {prov.specialty || prov.specialization || 'Consultant'}
+                      </div>
+                    </div>
+                    {isSelected && (
+                      <CheckCircle2 className="w-4 h-4 text-blue-400" />
+                    )}
+                  </button>
+                );
+              })}
             </div>
           </div>
 
@@ -843,7 +859,7 @@ export const WalkInBookingPanel: React.FC<WalkInBookingPanelProps> = ({
             <div>
               <p className="text-xs font-bold text-indigo-400 uppercase tracking-wider">Where to go:</p>
               <h4 className="text-base font-bold text-white">
-                {issuedTicket.stationName || 'Room 101 - Dr. Sharma'}
+                {issuedTicket.stationName || 'Doctor Consultation Room'}
               </h4>
               <p className="text-xs text-slate-400">
                 Please wait in the 1st Floor Lobby. Your token will be called on the screen.

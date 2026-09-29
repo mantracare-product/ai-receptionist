@@ -56,6 +56,7 @@ import {
   Receipt,
 } from 'lucide-react';
 import { AnimatedAvatar, type AvatarState } from './components/AnimatedAvatar';
+import { TokenAndCurrentServingCard } from './components/TokenAndCurrentServingCard';
 import { WhisperAudioRecorder } from '../lib/whisperRecorder';
 import { getMaClient } from '../lib/api/maClient';
 import {
@@ -91,7 +92,8 @@ export type ScreenState =
   | 'MY_VISIT'
   | 'DIRECTIONS_CATEGORIES'
   | 'DIRECTIONS_ROOMS'
-  | 'DIRECTIONS_RESULT';
+  | 'DIRECTIONS_RESULT'
+  | 'COMING_SOON';
 
 export type AmbientPhase = 'dormant' | 'engaged' | 'greeting' | 'listening' | 'routing';
 export type FaceScanPhase = 'idle' | 'starting' | 'scanning' | 'success' | 'no_match' | 'denied';
@@ -294,7 +296,18 @@ const DIRECTIONS_WORDS = [
   'पीने का पानी',
 ];
 
-
+const FEEDBACK_WORDS = [
+  'feedback',
+  'rate',
+  'rating',
+  'review',
+  'complaint',
+  'suggestion',
+  'experience',
+  'प्रतिक्रिया',
+  'सुझाव',
+  'शिकायत',
+];
 
 export const CategoryIcon: React.FC<{ icon?: string; className?: string }> = ({
   icon,
@@ -390,6 +403,7 @@ export const AvatarReceptionView: React.FC = () => {
   // Navigation & Flow State (AMBIENT is default on load/reset)
   const [screen, setScreen] = useState<ScreenState>('AMBIENT');
   const [flowType, setFlowType] = useState<FlowType>(null);
+  const [branchCase, setBranchCase] = useState<'CASE_1' | 'CASE_2' | 'CASE_3' | null>(null);
   const [currentLanguage, setCurrentLanguage] = useState<'en' | 'hi'>('en');
 
   // AMBIENT Presence & Greeting Sub-state Machine
@@ -406,7 +420,12 @@ export const AvatarReceptionView: React.FC = () => {
   const ambientSpeechRecognitionRef = useRef<any>(null);
   const whisperRecorderRef = useRef<WhisperAudioRecorder | null>(null);
   const isAriaSpeakingRef = useRef<boolean>(false);
+  const lastSpokenTextRef = useRef<string>('');
+  const lastSpokenEndTimeRef = useRef<number>(0);
+  const isWhisperServerAvailableRef = useRef<boolean>(true);
   const startAmbientListeningRef = useRef<(() => void) | null>(null);
+  const startVoiceListeningRef = useRef<(() => void) | null>(null);
+  const handleVoiceCommandRef = useRef<((rawTranscript: string) => Promise<boolean | void>) | null>(null);
   const noticedDwellRef = useRef<number>(0);
   const closeDwellRef = useRef<number>(0);
   const lastFaceSeenTimeRef = useRef<number>(0);
@@ -443,7 +462,7 @@ export const AvatarReceptionView: React.FC = () => {
   const [liveHint, setLiveHint] = useState<string>("Tap Start scanning when you're ready");
   const [faceConfidence, setFaceConfidence] = useState<number>(0);
   const [faceAttempts, setFaceAttempts] = useState<number>(0);
-  const [matchedCandidateName, setMatchedCandidateName] = useState<string>('Sunita');
+  const [matchedCandidateName, setMatchedCandidateName] = useState<string>('Priya');
 
   // Face Registration State Machine (Walk-in onboarding flow)
   const [faceRegPhase, setFaceRegPhase] = useState<FaceRegistrationPhase>('intro');
@@ -636,6 +655,9 @@ export const AvatarReceptionView: React.FC = () => {
       if (screen === 'AMBIENT' || screen === 'IDLE' || screen.startsWith('DIRECTIONS') || screen === 'MY_VISIT') {
         setScreen('PHONE');
       }
+    } else if (pathname === '/reception/feedback') {
+      setScreen('COMING_SOON');
+      setFlowType(null);
     } else if (pathname === '/reception/directions') {
       setScreen('DIRECTIONS_CATEGORIES');
       setFlowType(null);
@@ -815,6 +837,7 @@ export const AvatarReceptionView: React.FC = () => {
       thinkMsg?: string,
       onEnd?: () => void
     ) => {
+      lastSpokenTextRef.current = text.toLowerCase();
       setCaptionText(text);
       setUserTranscriptText('');
       setIsUserSpeaking(false);
@@ -827,11 +850,13 @@ export const AvatarReceptionView: React.FC = () => {
           isAriaSpeakingRef.current = true;
           setTimeout(() => {
             isAriaSpeakingRef.current = false;
+            lastSpokenEndTimeRef.current = Date.now();
             setAvatarState('idle');
             onEnd?.();
           }, 2400);
         } else {
           isAriaSpeakingRef.current = false;
+          lastSpokenEndTimeRef.current = Date.now();
           onEnd?.();
         }
         return;
@@ -862,30 +887,36 @@ export const AvatarReceptionView: React.FC = () => {
         };
         utterance.onend = () => {
           isAriaSpeakingRef.current = false;
+          lastSpokenEndTimeRef.current = Date.now();
           if (state !== 'success' && state !== 'thinking') {
             setAvatarState('idle');
           }
-          // Small 150ms acoustic buffer before triggering next step
           setTimeout(() => {
             onEnd?.();
-          }, 150);
+            // Automatically resume continuous voice listening after Aria speaks
+            startVoiceListeningRef.current?.();
+          }, 450);
         };
         utterance.onerror = () => {
           isAriaSpeakingRef.current = false;
+          lastSpokenEndTimeRef.current = Date.now();
           if (state !== 'success' && state !== 'thinking') {
             setAvatarState('idle');
           }
           setTimeout(() => {
             onEnd?.();
-          }, 150);
+            startVoiceListeningRef.current?.();
+          }, 450);
         };
 
         isAriaSpeakingRef.current = true;
         window.speechSynthesis.speak(utterance);
       } catch {
         isAriaSpeakingRef.current = false;
+        lastSpokenEndTimeRef.current = Date.now();
         setAvatarState('idle');
         onEnd?.();
+        startVoiceListeningRef.current?.();
       }
     },
     [isMuted, currentLanguage, getFemaleVoice]
@@ -1128,25 +1159,26 @@ export const AvatarReceptionView: React.FC = () => {
     }
   }, [screen, facePhase, ambientPhase]);
 
-  // Speech listening and keyword intent resolver for AMBIENT screen
+  // Universal Voice Listening & Conversational Assistant across ALL screens
   const ambientListeningTimeoutRef = useRef<any>(null);
   const unrecognizedAttemptsRef = useRef<number>(0);
 
-  const startAmbientListening = useCallback(() => {
-    if (screenRef.current !== 'AMBIENT') return;
+  const startVoiceListening = useCallback(() => {
     if (typeof window === 'undefined') return;
 
     // Delay start if Aria is actively speaking to prevent mic picking up speaker output
     if (isAriaSpeakingRef.current) {
       setTimeout(() => {
-        if (screenRef.current === 'AMBIENT') {
-          startAmbientListening();
+        if (!isAriaSpeakingRef.current) {
+          startVoiceListening();
         }
-      }, 300);
+      }, 350);
       return;
     }
 
-    setAmbientPhase('listening');
+    if (screenRef.current === 'AMBIENT') {
+      setAmbientPhase('listening');
+    }
     setAvatarState('idle');
 
     if (ambientListeningTimeoutRef.current) {
@@ -1160,9 +1192,82 @@ export const AvatarReceptionView: React.FC = () => {
       whisperRecorderRef.current = null;
     }
 
-    let intentHandled = false;
+    // Fallback: Browser Web Speech API
+    const startBrowserSpeechFallback = () => {
+      const SpeechRec =
+        typeof window !== 'undefined'
+          ? (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+          : null;
 
-    // 1. Primary Engine: Neural Whisper STT via /api/stt/transcribe
+      if (!SpeechRec || isAriaSpeakingRef.current) return;
+
+      // If speech recognition is already running, avoid recreating
+      if (ambientSpeechRecognitionRef.current) {
+        return;
+      }
+
+      try {
+        const fallbackRec = new SpeechRec();
+        fallbackRec.lang = currentLanguage === 'hi' ? 'hi-IN' : 'en-US';
+        fallbackRec.continuous = false;
+        fallbackRec.interimResults = false;
+
+        fallbackRec.onstart = () => {
+          console.log('[STT Fallback] Web Speech API active and listening.');
+        };
+
+        fallbackRec.onresult = async (evt: any) => {
+          const fallbackText = evt.results?.[0]?.[0]?.transcript || '';
+          if (fallbackText && !isAriaSpeakingRef.current) {
+            console.log(`[User Spoke Fallback STT 🗣️]: "${fallbackText}"`);
+            setUserTranscriptText(fallbackText);
+            setIsUserSpeaking(false);
+            if (screenRef.current === 'AMBIENT') {
+              setAmbientPhase('routing');
+            }
+            try { fallbackRec.stop(); } catch {}
+            if (handleVoiceCommandRef.current) {
+              await handleVoiceCommandRef.current(fallbackText);
+            }
+          }
+        };
+
+        fallbackRec.onerror = (recErr: any) => {
+          const errCode = recErr?.error;
+          if (errCode !== 'aborted' && errCode !== 'no-speech') {
+            console.warn('[STT Fallback] Browser speech recognition notice:', errCode || recErr);
+          }
+          setIsUserSpeaking(false);
+          ambientSpeechRecognitionRef.current = null;
+        };
+
+        fallbackRec.onend = () => {
+          setIsUserSpeaking(false);
+          ambientSpeechRecognitionRef.current = null;
+          if (!isAriaSpeakingRef.current) {
+            setAvatarState('idle');
+            setTimeout(() => {
+              if (!isAriaSpeakingRef.current && !ambientSpeechRecognitionRef.current) {
+                startVoiceListening();
+              }
+            }, 350);
+          }
+        };
+
+        ambientSpeechRecognitionRef.current = fallbackRec;
+        fallbackRec.start();
+      } catch (recErr) {
+        ambientSpeechRecognitionRef.current = null;
+      }
+    };
+
+    // If server Whisper STT is unconfigured / unavailable, run browser Web Speech API directly
+    if (!isWhisperServerAvailableRef.current) {
+      startBrowserSpeechFallback();
+      return;
+    }
+
+    // 1. Primary Engine: Neural Whisper STT via /api/stt/transcribe (Groq Turbo)
     try {
       const whisperRecorder = new WhisperAudioRecorder({
         language: currentLanguage === 'hi' ? 'hi' : 'en',
@@ -1172,10 +1277,20 @@ export const AvatarReceptionView: React.FC = () => {
           }
         },
         onTranscript: async (transcript: string) => {
-          if (isAriaSpeakingRef.current || intentHandled) return;
+          if (isAriaSpeakingRef.current) return;
+          if (Date.now() - lastSpokenEndTimeRef.current < 450) {
+            console.log('[Whisper STT] Ignored speech captured during cooldown:', transcript);
+            setIsUserSpeaking(false);
+            return;
+          }
 
           const normalizedLower = transcript.toLowerCase();
+          const lastSpoken = lastSpokenTextRef.current;
+          
           const isEcho =
+            (Boolean(lastSpoken) && lastSpoken.length > 5 && (lastSpoken.includes(normalizedLower) || normalizedLower.includes(lastSpoken.slice(0, 20)))) ||
+            normalizedLower.includes('look into the camera') ||
+            normalizedLower.includes('phone number below') ||
             normalizedLower.includes('how can i help') ||
             normalizedLower.includes('welcome to mantracare') ||
             normalizedLower.includes('welcome to mantra care') ||
@@ -1188,29 +1303,36 @@ export const AvatarReceptionView: React.FC = () => {
             normalizedLower.includes('नमस्ते') ||
             normalizedLower.includes('सहायता कर सकती');
 
-          if (isEcho) {
+          if (isEcho && Date.now() - lastSpokenEndTimeRef.current < 4000) {
             console.log('[Whisper STT] Ignored system voice echo:', transcript);
             setIsUserSpeaking(false);
             return;
           }
 
-          console.log(`[User Spoke 🗣️]: "${transcript}"`);
+          console.log(`[User Spoke 🗣️]: "${transcript}" (Current Screen: ${screenRef.current})`);
           setUserTranscriptText(transcript);
           setIsUserSpeaking(false);
-          intentHandled = true;
-          setAmbientPhase('routing');
-          whisperRecorder.stop();
-          stopCameraStream();
 
-          setTimeout(async () => {
-            if (resolveIntentRef.current) {
-              await resolveIntentRef.current(transcript, { isAmbient: true });
-            }
-          }, 80);
+          if (screenRef.current === 'AMBIENT') {
+            setAmbientPhase('routing');
+          }
+
+          if (handleVoiceCommandRef.current) {
+            await handleVoiceCommandRef.current(transcript);
+          }
         },
-        onError: (err) => {
+        onError: (err, isServerUnavailable) => {
           console.warn('[Whisper STT] Recorder notice:', err);
           setIsUserSpeaking(false);
+          try { whisperRecorder.stop(); } catch {}
+          whisperRecorderRef.current = null;
+
+          if (isServerUnavailable) {
+            isWhisperServerAvailableRef.current = false;
+          }
+
+          // Seamless fallback to browser Web Speech API
+          startBrowserSpeechFallback();
         },
       });
 
@@ -1220,17 +1342,11 @@ export const AvatarReceptionView: React.FC = () => {
       whisperRecorderRef.current = whisperRecorder;
     } catch (err) {
       console.warn('[Whisper STT] Init failed:', err);
+      startBrowserSpeechFallback();
     }
-
-    // Reset to dormant if no speech heard within 16 seconds
-    ambientListeningTimeoutRef.current = setTimeout(() => {
-      if (!intentHandled && screenRef.current === 'AMBIENT' && ambientPhaseRef.current === 'listening') {
-        whisperRecorderRef.current?.stop();
-        setAmbientPhase('dormant');
-      }
-    }, 16000);
-  }, [currentLanguage, stopCameraStream]);
-  startAmbientListeningRef.current = startAmbientListening;
+  }, [currentLanguage]);
+  startAmbientListeningRef.current = startVoiceListening;
+  startVoiceListeningRef.current = startVoiceListening;
 
   // Presence Trigger Flow on AMBIENT screen (Button tap OR close face auto-detection)
   // Sequence: dormant -> engaged (300-500ms attentive pose) -> greeting (TTS welcome) -> listening (chained onend) -> routing -> destination
@@ -1283,7 +1399,7 @@ export const AvatarReceptionView: React.FC = () => {
           setTimeout(() => {
             if (screenRef.current === 'AMBIENT') {
               setAmbientPhase('listening');
-              startAmbientListening();
+              startVoiceListening();
             }
           }, 200);
         }
@@ -1291,7 +1407,15 @@ export const AvatarReceptionView: React.FC = () => {
 
       speak(greetingText, 'speaking', undefined, onGreetingFinished);
     }, 300);
-  }, [currentLanguage, speak, startAmbientListening]);
+  }, [currentLanguage, speak, startVoiceListening]);
+
+  // Continuous Voice Listening Lifecycle across all screens
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!isAriaSpeakingRef.current) {
+      startVoiceListening();
+    }
+  }, [screen, currentLanguage, startVoiceListening]);
 
   // Presence Detection Loop: Only runs on AMBIENT (Throttled ~5 FPS / 200ms)
   // Bounding-box numbers stay strictly in memory and are discarded immediately after calculation.
@@ -1389,7 +1513,7 @@ export const AvatarReceptionView: React.FC = () => {
         if (phase === 'engaged' || phase === 'greeting') {
           triggerPresenceFlow();
         } else if (phase === 'listening') {
-          startAmbientListening();
+          startVoiceListening();
         }
       };
       (window as any).__triggerAmbientIntent = async (phrase: string) => {
@@ -1404,7 +1528,7 @@ export const AvatarReceptionView: React.FC = () => {
         }, 500);
       };
     }
-  }, [triggerPresenceFlow, startAmbientListening, stopCameraStream]);
+  }, [triggerPresenceFlow, startVoiceListening, stopCameraStream]);
 
   // Cancel scanning & reset to idle preview
   const cancelScanning = useCallback(() => {
@@ -1486,25 +1610,51 @@ export const AvatarReceptionView: React.FC = () => {
           const matchResult = await maClient.matchFaceTemplate(capturedVector, 0.70);
 
           if (matchResult.matched && matchResult.client) {
-            setSelectedPatient(matchResult.client);
+            const matchedClient = matchResult.client;
+            setSelectedPatient(matchedClient);
             setFaceConfidence(matchResult.confidence);
-            const firstName = matchResult.client.name.split(' ')[0] || 'Sunita';
+            const firstName = matchedClient.name.split(' ')[0] || 'Patient';
             setMatchedCandidateName(firstName);
-            setFacePhase('success');
-            setLiveHint('Face verified!');
-            speak(
-              currentLanguage === 'hi'
-                ? `नमस्ते ${firstName}! क्या आप यही हैं?`
-                : `Hi ${firstName}! Is this you? Please confirm to view your visit summary.`,
-              'success'
-            );
+
+            let summary: VisitSummary | null = null;
+            try {
+              summary = await maClient.getVisitSummary(matchedClient.id);
+            } catch {}
+
+            if (summary && summary.appointment && summary.appointment.status === 'confirmed') {
+              // Case 1: Recognized with scheduled appointment today
+              setBranchCase('CASE_1');
+              setVisitSummary(summary);
+              setFacePhase('success');
+              setLiveHint('Appointment verified!');
+              speak(
+                currentLanguage === 'hi'
+                  ? `नमस्ते ${firstName}! क्या आप यही हैं?`
+                  : `Hi ${firstName}! Is this you? Please confirm to view your visit summary.`,
+                'success'
+              );
+            } else {
+              // Case 2: Recognized existing patient without appointment today
+              setBranchCase('CASE_2');
+              setVisitSummary(null);
+              setFacePhase('success');
+              setLiveHint('Profile verified!');
+              speak(
+                currentLanguage === 'hi'
+                  ? `नमस्ते ${firstName}! आपका स्वागत है। आइए आपका वॉक-इन परामर्श बुक करें।`
+                  : `Hi ${firstName}! Welcome back. Let's get you registered for a walk-in consultation.`,
+                'success'
+              );
+            }
           } else {
+            // Case 3: Not recognized (new patient walk-in)
+            setBranchCase('CASE_3');
             setFaceAttempts((prev) => prev + 1);
             setFacePhase('no_match');
             speak(
               currentLanguage === 'hi'
-                ? 'कोई अपॉइंटमेंट नहीं मिला। कृपया पुनः प्रयास करें।'
-                : "I couldn't match an appointment with this scan. You can try again or use your phone number.",
+                ? 'कोई प्रोफ़ाइल नहीं मिली। आप पुनः प्रयास कर सकते हैं या नया पंजीकरण शुरू कर सकते हैं।'
+                : "I couldn't match a profile with this scan. You can try again or register as a new patient.",
               'apologetic'
             );
           }
@@ -1609,33 +1759,48 @@ export const AvatarReceptionView: React.FC = () => {
     };
   }, [handleUserActivity]);
 
+  // Unified Appointment & Walk-in Entry Point (PRD Section 3.1 & Global Principles 1 & 2)
+  const enterAppointmentFlow = useCallback(() => {
+    handleUserActivity();
+    stopCameraStream();
+    setFlowType('SCHEDULED');
+    setBranchCase(null);
+    setScreen('FACE_SCAN');
+    if (location.pathname !== '/reception/appointment') {
+      navigate('/reception/appointment');
+    }
+    speak(
+      currentLanguage === 'hi'
+        ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
+        : 'Please look into the camera to check in, or use your phone number below.'
+    );
+  }, [handleUserActivity, stopCameraStream, currentLanguage, location.pathname, navigate, speak]);
+
+  // Open Feedback handler (PRD Section 5: routes to COMING_SOON)
+  const handleOpenFeedback = useCallback(() => {
+    handleUserActivity();
+    stopCameraStream();
+    setFlowType(null);
+    setScreen('COMING_SOON');
+    if (location.pathname !== '/reception/feedback') {
+      navigate('/reception/feedback');
+    }
+    speak(
+      currentLanguage === 'hi'
+        ? 'मरीज़ प्रतिक्रिया सुविधा जल्द ही उपलब्ध होगी।'
+        : 'Patient feedback submission will be available soon in an upcoming update.'
+    );
+  }, [handleUserActivity, stopCameraStream, currentLanguage, location.pathname, navigate, speak]);
+
   // Navigation Handlers
   const handleNavClick = (
-    target: 'home' | 'checkin' | 'new_patient' | 'payment' | 'directions' | 'my_visit' | 'lang' | 'staff'
+    target: 'home' | 'checkin' | 'payment' | 'feedback' | 'directions' | 'my_visit' | 'lang' | 'staff'
   ) => {
     handleUserActivity();
     if (target === 'home') {
       handleResetSession();
     } else if (target === 'checkin') {
-      stopCameraStream();
-      setFlowType('SCHEDULED');
-      setScreen('FACE_SCAN');
-      navigate('/reception/appointment');
-      speak(
-        currentLanguage === 'hi'
-          ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
-          : 'Please look into the camera to check in, or use your phone number below.'
-      );
-    } else if (target === 'new_patient') {
-      stopCameraStream();
-      setFlowType('WALK_IN');
-      setScreen('PHONE');
-      navigate('/reception/walk-in');
-      speak(
-        currentLanguage === 'hi'
-          ? 'स्वागत है! पंजीकरण शुरू करने के लिए अपना फोन नंबर दर्ज करें।'
-          : 'Welcome! Please enter your mobile phone number on the touch keypad to begin registration.'
-      );
+      enterAppointmentFlow();
     } else if (target === 'payment') {
       stopCameraStream();
       setFlowType('PAYMENT');
@@ -1646,6 +1811,8 @@ export const AvatarReceptionView: React.FC = () => {
           ? 'कृपया अपना बिल और बकाया देखने के लिए अपना मोबाइल नंबर दर्ज करें।'
           : 'Please enter your mobile phone number on the touch keypad to look up your bill.'
       );
+    } else if (target === 'feedback') {
+      handleOpenFeedback();
     } else if (target === 'directions') {
       handleOpenDirections();
     } else if (target === 'my_visit') {
@@ -1667,18 +1834,33 @@ export const AvatarReceptionView: React.FC = () => {
     }
   };
 
-  // Privacy gate confirmation
+  // Privacy gate confirmation (Branches between Case 1 and Case 2)
   const handleFaceConfirmYes = async () => {
     handleUserActivity();
     if (!selectedPatient) return;
-    speak('Loading your visit summary...', 'thinking', 'Retrieving appointment & room details...');
-    const summary = await maClient.getVisitSummary(selectedPatient.id);
-    setVisitSummary(summary);
-    setScreen('DETAILS_SUMMARY');
-    speak(
-      `Welcome ${selectedPatient.name}. Your appointment for ${summary.appointment.serviceName} is assigned to ${summary.room.roomName}. Please confirm check-in.`,
-      'speaking'
-    );
+
+    if (branchCase === 'CASE_2') {
+      // Case 2: Recognized existing patient without appointment today -> Direct to service/doctor selection
+      setFlowType('WALK_IN');
+      setSelectedServiceId('');
+      setSelectedProviderId('next_available');
+      setScreen('SERVICE_DOCTOR');
+      speak(
+        currentLanguage === 'hi'
+          ? `नमस्ते ${selectedPatient.name.split(' ')[0]}! कृपया अपनी परामर्श सेवा और चिकित्सक चुनें।`
+          : `Welcome back ${selectedPatient.name.split(' ')[0]}! Please select your consultation service and provider.`
+      );
+    } else {
+      // Case 1: Recognized with scheduled appointment today -> DETAILS_SUMMARY
+      speak('Loading your visit summary...', 'thinking', 'Retrieving appointment & room details...');
+      const summary = visitSummary || (await maClient.getVisitSummary(selectedPatient.id));
+      setVisitSummary(summary);
+      setScreen('DETAILS_SUMMARY');
+      speak(
+        `Welcome ${selectedPatient.name}. Your appointment for ${summary.appointment.serviceName} is assigned to ${summary.room.roomName}. Please confirm check-in.`,
+        'speaking'
+      );
+    }
   };
 
   const handleFaceConfirmNo = () => {
@@ -1754,19 +1936,10 @@ export const AvatarReceptionView: React.FC = () => {
 
       const found = await maClient.lookupClientsByPhone(phoneNumber, verifyRes.sessionToken);
 
-      if (flowType === 'SCHEDULED' || flowType === 'PAYMENT') {
+      if (flowType === 'PAYMENT') {
         if (!found || found.length === 0) {
-          setErrorMessage(
-            flowType === 'PAYMENT'
-              ? 'No billing records found for this phone number.'
-              : 'No appointment found for this phone number. Please register as new patient.'
-          );
-          speak(
-            flowType === 'PAYMENT'
-              ? 'We could not find any billing records for this number. Please check with the front desk.'
-              : 'We could not find an appointment with this number. You can register as a new patient.',
-            'apologetic'
-          );
+          setErrorMessage('No billing records found for this phone number.');
+          speak('We could not find any billing records for this number. Please check with the front desk.', 'apologetic');
           setScreen('PHONE');
           return;
         }
@@ -1777,24 +1950,66 @@ export const AvatarReceptionView: React.FC = () => {
           const summary = await maClient.getVisitSummary(pat.id);
           setVisitSummary(summary);
           setScreen('DETAILS_SUMMARY');
-          speak(
-            flowType === 'PAYMENT'
-              ? `Welcome ${pat.name}. Here are your pending bills and visit summary.`
-              : `Welcome ${pat.name}. Here are your appointment details. Please confirm check-in.`
-          );
+          speak(`Welcome ${pat.name}. Here are your pending bills and visit summary.`);
         } else {
           setPatients(found);
           setScreen('PATIENT_PICK');
-          speak(
-            flowType === 'PAYMENT'
-              ? 'Multiple profiles are registered under this number. Whose bill would you like to view?'
-              : 'Multiple patients are registered under this number. Who is checking in today?'
-          );
+          speak('Multiple profiles are registered under this number. Whose bill would you like to view?');
+        }
+        return;
+      }
+
+      // flowType === 'SCHEDULED' (Unified Appointment / Walk-in flow)
+      if (flowType === 'SCHEDULED') {
+        if (!found || found.length === 0) {
+          // PRD Case 3: Unknown / Unregistered Patient -> Prompt for new registration
+          setBranchCase('CASE_3');
+          setSelectedPatient(null);
+          setVisitSummary(null);
+          setOnboardingForm((prev) => ({
+            ...prev,
+            name: '',
+            age: 30,
+            gender: 'Female',
+            email: '',
+          }));
+          setScreen('ONBOARDING_DETAILS');
+          speak("We couldn't find an existing profile with this number. Let's get you registered as a new patient.");
+          return;
+        }
+
+        if (found.length === 1) {
+          const pat = found[0];
+          setSelectedPatient(pat);
+          const todayApts = await maClient.getTodayAppointments(pat.id, verifyRes.sessionToken);
+
+          if (todayApts && todayApts.length > 0) {
+            // PRD Case 1: Existing Client with Scheduled Appointment
+            setBranchCase('CASE_1');
+            const summary = await maClient.getVisitSummary(pat.id, todayApts[0].id);
+            setVisitSummary(summary);
+            setScreen('DETAILS_SUMMARY');
+            speak(`Welcome ${pat.name}. Here are your appointment details for ${todayApts[0].serviceName || 'your consultation'}. Please confirm check-in.`, 'success');
+          } else {
+            // PRD Case 2: Existing Client without Scheduled Appointment (Walk-in)
+            setBranchCase('CASE_2');
+            setVisitSummary(null);
+            setSelectedServiceId('');
+            setSelectedProviderId('next_available');
+            setScreen('SERVICE_DOCTOR');
+            speak(`Welcome back, ${pat.name}! We didn't find a scheduled appointment for today. Let's get you registered for a walk-in consultation.`, 'success');
+          }
+        } else {
+          // Multiple family members
+          setPatients(found);
+          setScreen('PATIENT_PICK');
+          speak('Multiple patients are registered under this number. Who is checking in today?');
         }
       } else {
-        // Walk-in / New Patient
+        // Direct Walk-in / New Patient
         if (found && found.length > 0) {
           const first = found[0];
+          setSelectedPatient(first);
           setOnboardingForm((prev) => ({
             ...prev,
             name: first.name,
@@ -1815,14 +2030,28 @@ export const AvatarReceptionView: React.FC = () => {
   const handleSelectFamilyPatient = async (pat: PatientSummary) => {
     handleUserActivity();
     setSelectedPatient(pat);
-    const summary = await maClient.getVisitSummary(pat.id);
-    setVisitSummary(summary);
-    setScreen('DETAILS_SUMMARY');
-    speak(
-      flowType === 'PAYMENT'
-        ? `Welcome ${pat.name}. Here are your pending bills and visit summary.`
-        : `Welcome ${pat.name}. Please confirm your appointment details.`
-    );
+    if (flowType === 'PAYMENT') {
+      const summary = await maClient.getVisitSummary(pat.id);
+      setVisitSummary(summary);
+      setScreen('DETAILS_SUMMARY');
+      speak(`Welcome ${pat.name}. Here are your pending bills and visit summary.`);
+    } else {
+      const todayApts = await maClient.getTodayAppointments(pat.id);
+      if (todayApts && todayApts.length > 0) {
+        setBranchCase('CASE_1');
+        const summary = await maClient.getVisitSummary(pat.id, todayApts[0].id);
+        setVisitSummary(summary);
+        setScreen('DETAILS_SUMMARY');
+        speak(`Welcome ${pat.name}. Here are your appointment details for ${todayApts[0].serviceName || 'your consultation'}. Please confirm check-in.`, 'success');
+      } else {
+        setBranchCase('CASE_2');
+        setVisitSummary(null);
+        setSelectedServiceId('');
+        setSelectedProviderId('next_available');
+        setScreen('SERVICE_DOCTOR');
+        speak(`Welcome back, ${pat.name}! We didn't find a scheduled appointment for today. Let's get you registered for a walk-in consultation.`, 'success');
+      }
+    }
   };
 
   // --- FLOW 3: Confirm Check-In & Token Issuance ---
@@ -1998,11 +2227,11 @@ export const AvatarReceptionView: React.FC = () => {
   // Test hooks for duplicate & quality simulation
   useEffect(() => {
     if (typeof window !== 'undefined') {
-      (window as any).__simulateDuplicateFace = (name = 'Sunita Rao') => {
+      (window as any).__simulateDuplicateFace = (name = 'Priya Sharma') => {
         setDuplicateCandidate({
-          id: 'pat_dup',
+          id: 'CL-013',
           name,
-          phone: '+91 91234 56780',
+          phone: '+91 98201 72818',
           age: 58,
           gender: 'Female',
           faceEnrolled: true,
@@ -2010,19 +2239,88 @@ export const AvatarReceptionView: React.FC = () => {
         setFaceRegPhase('duplicate_found');
         speak(`It looks like you may already be registered. Is your name ${name}?`, 'thinking');
       };
-      (window as any).__simulateBadQuality = () => {
-        setRegAttempts((prev) => prev + 1);
-        setRegHint('Please center your face and hold still');
+      (window as any).__simulateCase1_Scheduled = () => {
+        enterAppointmentFlow();
+        setTimeout(() => {
+          setSelectedPatient({
+            id: 'CL-013',
+            name: 'Priya Sharma',
+            phone: '+91 98201 72818',
+            age: 58,
+            gender: 'Female',
+            relation: 'Self',
+            faceEnrolled: true,
+          });
+          setFaceConfidence(0.94);
+          setMatchedCandidateName('Priya');
+          setBranchCase('CASE_1');
+          setVisitSummary({
+            patient: {
+              id: 'CL-013',
+              name: 'Priya Sharma',
+              age: 58,
+              gender: 'Female',
+              maskedPhone: '+91 98201••••18',
+              faceEnrolled: true,
+            },
+            appointment: {
+              id: 'apt_2',
+              serviceName: 'Cardiology Checkup',
+              providerName: 'Dr. Rajesh Patel',
+              date: new Date().toISOString().split('T')[0],
+              time: '11:00 AM',
+              status: 'confirmed',
+              source: 'ai_receptionist',
+            },
+            room: {
+              stationId: 'st-consult-1',
+              roomName: "Dr. Sharma's Consultation Room",
+              floorWing: 'Ground Floor, Clinical Wing B',
+              directions: 'Proceed down hallway B, past reception counter, 2nd door on right.',
+              tokenLabel: 'D-002',
+              estimatedWaitMin: 12,
+            },
+          });
+          setFacePhase('success');
+          setLiveHint('Appointment verified!');
+          speak('Hi Priya! Is this you? Please confirm to view your visit summary.', 'success');
+        }, 300);
       };
-      (window as any).__simulateCameraDenied = () => {
-        stopCameraStream();
-        setFaceRegPhase('denied');
+
+      (window as any).__simulateCase2_ExistingWalkin = () => {
+        enterAppointmentFlow();
+        setTimeout(() => {
+          setSelectedPatient({
+            id: 'CL-014',
+            name: 'Rahul Patel',
+            phone: '+91 98765 43210',
+            age: 34,
+            gender: 'Male',
+            relation: 'Self',
+            faceEnrolled: true,
+          });
+          setFaceConfidence(0.91);
+          setMatchedCandidateName('Rahul');
+          setBranchCase('CASE_2');
+          setVisitSummary(null);
+          setFacePhase('success');
+          setLiveHint('Profile verified!');
+          speak("Hi Rahul! Welcome back. Let's get you registered for a walk-in consultation.", 'success');
+        }, 300);
       };
-      (window as any).__triggerFaceRegCapture = () => {
-        handleStartFaceRegistration();
+
+      (window as any).__simulateCase3_NewPatient = () => {
+        enterAppointmentFlow();
+        setTimeout(() => {
+          setSelectedPatient(null);
+          setBranchCase('CASE_3');
+          setFaceAttempts((prev) => prev + 1);
+          setFacePhase('no_match');
+          speak("I couldn't match a profile with this scan. You can try again or register as a new patient.", 'apologetic');
+        }, 300);
       };
     }
-  }, [handleStartFaceRegistration, speak, stopCameraStream]);
+  }, [handleStartFaceRegistration, enterAppointmentFlow, speak, stopCameraStream]);
 
   const handleOnboardingApprove = async () => {
     handleUserActivity();
@@ -2059,18 +2357,58 @@ export const AvatarReceptionView: React.FC = () => {
     speak('Booking appointment and attaching clinic visit journey...', 'thinking', 'Reserving doctor slot...');
     try {
       const todayStr = new Date().toISOString().split('T')[0];
+      const now = new Date();
+      let hours = now.getHours();
+      const minutes = now.getMinutes();
+      const ampm = hours >= 12 ? 'PM' : 'AM';
+      hours = hours % 12;
+      hours = hours ? hours : 12;
+      const timeStr = `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')} ${ampm}`;
+
       const apt = await maClient.bookAppointment({
         clientId: selectedPatient.id,
+        clientName: selectedPatient.name,
+        clientPhone: selectedPatient.phone,
+        clientEmail: (selectedPatient as any).email || undefined,
         serviceId: selectedServiceId,
         providerId: selectedProviderId === 'next_available' ? undefined : selectedProviderId,
         date: todayStr,
-        time: 'Now (Next Available)',
+        time: timeStr,
         reason: onboardingForm.reason,
         source: 'ai_receptionist',
       });
 
       const checkinRes = await maClient.checkinAppointment(apt.id, selectedPatient.id, sessionToken);
       setIssuedTicket(checkinRes.ticket);
+      
+      setVisitSummary({
+        patient: {
+          id: selectedPatient.id,
+          name: selectedPatient.name,
+          age: selectedPatient.age,
+          gender: selectedPatient.gender,
+          maskedPhone: selectedPatient.phone,
+          faceEnrolled: selectedPatient.faceEnrolled,
+        },
+        appointment: {
+          id: apt.id,
+          serviceName: apt.serviceName || 'Consultation',
+          providerName: apt.providerName || 'Doctor',
+          date: apt.date,
+          time: apt.time,
+          status: 'confirmed',
+          source: 'ai_receptionist',
+        },
+        room: {
+          stationId: checkinRes.ticket.stationId,
+          roomName: checkinRes.ticket.stationName,
+          floorWing: 'Ground Floor, Clinical Wing',
+          directions: `Please proceed to ${checkinRes.ticket.stationName}. Your token will be announced.`,
+          tokenLabel: checkinRes.ticket.tokenLabel,
+          estimatedWaitMin: checkinRes.ticket.estimatedWaitMin || 10,
+        },
+      });
+
       setScreen('TOKEN_ISSUED');
       speak(
         `Your visit is booked and confirmed! Your token number is ${checkinRes.ticket.tokenLabel}. Please proceed to ${checkinRes.ticket.stationName}.`,
@@ -2352,36 +2690,41 @@ export const AvatarReceptionView: React.FC = () => {
         return true;
       }
 
-      // Priority 3: General Intents (Walk-in, Payment, Appointment, Generic Directions)
-      const isWalkin = WALKIN_WORDS.some((w) => normalized.includes(w.toLowerCase()));
-      const isPayment = !isWalkin && PAYMENT_WORDS.some((w) => normalized.includes(w.toLowerCase()));
-      const isAppointment = !isWalkin && !isPayment && APPOINTMENT_WORDS.some((w) => normalized.includes(w.toLowerCase()));
+      // Priority 3: General Intents (Walk-in, Payment, Feedback, Appointment, Generic Directions)
+      const isFeedback = FEEDBACK_WORDS.some((w) => normalized.includes(w.toLowerCase()));
+      const isWalkin = !isFeedback && WALKIN_WORDS.some((w) => normalized.includes(w.toLowerCase()));
+      const isPayment = !isFeedback && !isWalkin && PAYMENT_WORDS.some((w) => normalized.includes(w.toLowerCase()));
+      const isAppointment = !isFeedback && !isWalkin && !isPayment && APPOINTMENT_WORDS.some((w) => normalized.includes(w.toLowerCase()));
 
       console.log(`[Voice Intent Resolver] 🔍 General intent results for "${normalized}":`, {
+        isFeedback,
         isWalkin,
         isPayment,
         isAppointment,
         isExplicitDirections,
       });
 
-      // 3A. Walk-in Intent
-      if (isWalkin) {
+      // 3A. Feedback Intent
+      if (isFeedback) {
         unrecognizedAttemptsRef.current = 0;
-        console.log('[Voice Intent Resolver] 🎯 PRIORITY 3 MATCH: Walk-in Registration -> /reception/walk-in');
-        handleUserActivity();
-        stopCameraStream();
-        setFlowType('WALK_IN');
-        setScreen('PHONE');
-        navigate('/reception/walk-in');
-        speak(
-          currentLanguage === 'hi'
-            ? 'स्वागत है! पंजीकरण शुरू करने के लिए अपना फोन नंबर दर्ज करें।'
-            : 'Welcome! Please enter your mobile phone number on the touch keypad to begin registration.'
-        );
+        console.log('[Voice Intent Resolver] 🎯 PRIORITY 3 MATCH: Feedback -> handleOpenFeedback()');
+        handleOpenFeedback();
         return true;
       }
 
-      // 3B. Payment Intent
+      // 3B. Unified Appointment & Walk-in Intent (PRD Section 3.1 & Global Principle 1)
+      if (isAppointment || isWalkin) {
+        unrecognizedAttemptsRef.current = 0;
+        console.log('[Voice Intent Resolver] 🎯 PRIORITY 3 MATCH: Unified Appointment & Walk-in');
+        if (screenRef.current === 'FACE_SCAN' || screenRef.current === 'VERIFY_CHOICE' || screenRef.current === 'FACE_CONSENT') {
+          startScanning();
+          return true;
+        }
+        enterAppointmentFlow();
+        return true;
+      }
+
+      // 3C. Payment Intent
       if (isPayment) {
         unrecognizedAttemptsRef.current = 0;
         console.log('[Voice Intent Resolver] 🎯 PRIORITY 3 MATCH: Bill Payment -> /reception/billing');
@@ -2394,23 +2737,6 @@ export const AvatarReceptionView: React.FC = () => {
           currentLanguage === 'hi'
             ? 'कृपया अपना बिल और बकाया देखने के लिए अपना मोबाइल नंबर दर्ज करें।'
             : 'Please enter your mobile phone number on the touch keypad to look up your bill.'
-        );
-        return true;
-      }
-
-      // 3C. Appointment Intent
-      if (isAppointment) {
-        unrecognizedAttemptsRef.current = 0;
-        console.log('[Voice Intent Resolver] 🎯 PRIORITY 3 MATCH: Appointment Check-in -> /reception/appointment');
-        handleUserActivity();
-        stopCameraStream();
-        setFlowType('SCHEDULED');
-        setScreen('FACE_SCAN');
-        navigate('/reception/appointment');
-        speak(
-          currentLanguage === 'hi'
-            ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
-            : 'Please look into the camera to check in, or use your phone number below.'
         );
         return true;
       }
@@ -2481,27 +2807,28 @@ export const AvatarReceptionView: React.FC = () => {
   resolveIntentRef.current = handleResolveIntent;
   processDirectionsIntentRef.current = handleResolveIntent;
 
-  // Global Floating Mic & Voice Command State
-  const [isListeningGlobal, setIsListeningGlobal] = useState(false);
-  const [heardSuccessGlobal, setHeardSuccessGlobal] = useState(false);
-  const globalRecognitionRef = useRef<any>(null);
-  const globalTimeoutRef = useRef<any>(null);
   const activeFocusedFieldRef = useRef<'name' | 'reason' | 'email' | null>(null);
 
   // Screen Contextual Voice Command Handler
   const handleVoiceCommand = useCallback(
-    (rawTranscript: string) => {
-      const text = rawTranscript.trim().toLowerCase();
-      console.log(`[Voice Assistant] Heard: "${rawTranscript}" on screen: ${screen}`);
+    async (rawTranscript: string) => {
+      const text = (rawTranscript || '').trim().toLowerCase();
+      console.log(`[Voice Assistant] 🎙️ Processing user utterance: "${rawTranscript}" on screen: ${screen}`);
 
-      if (screen === 'IDLE' || screen === 'AMBIENT') {
+      if (!text) return;
+
+      // 1. If on AMBIENT screen, route directly via global intent resolver
+      if (screen === 'AMBIENT') {
         if (resolveIntentRef.current) {
-          resolveIntentRef.current(rawTranscript, { isAmbient: screen === 'AMBIENT' });
+          const handled = await resolveIntentRef.current(rawTranscript, { isAmbient: true });
+          if (handled) {
+            console.log(`[Voice Assistant] 🎯 Handled globally via resolveIntent on AMBIENT`);
+            return;
+          }
         }
-        return;
       }
 
-      // 1. Text input focus routing
+      // 2. Text input focus routing (Dictation into active field)
       if (activeFocusedFieldRef.current === 'name') {
         setOnboardingForm((prev) => ({ ...prev, name: rawTranscript.trim() }));
         setDictationSuccessField('name');
@@ -2519,31 +2846,54 @@ export const AvatarReceptionView: React.FC = () => {
         return;
       }
 
-      // 2. Screen-specific voice command routing
+      // 3. Screen-specific voice command routing
       if (screen === 'FACE_SCAN' || screen === 'VERIFY_CHOICE' || screen === 'FACE_CONSENT') {
-        if (text.includes('start') || text.includes('scan') || text.includes('begin') || text.includes('ready')) {
+        if (
+          text.includes('start scanning') ||
+          text.includes('start scan') ||
+          text.includes('scan my face') ||
+          text.includes('scan face') ||
+          text.includes('start') ||
+          text.includes('scan') ||
+          text.includes('begin') ||
+          text.includes('ready to scan') ||
+          text.includes('ready') ||
+          text.includes('check in') ||
+          text.includes('check-in') ||
+          text.includes('haan') ||
+          text.includes('shuru')
+        ) {
           startScanning();
+          return;
         } else if (text.includes('phone') || text.includes('number') || text.includes('mobile')) {
           stopCameraStream();
           startPhoneVerification();
-        } else if (text.includes('cancel') || text.includes('stop')) {
+          return;
+        } else if (text.includes('cancel') || text.includes('stop') || text.includes('home') || text.includes('back')) {
           cancelScanning();
+          return;
         }
       } else if (screen === 'FACE_CONFIRM') {
         if (text.includes('yes') || text.includes('me') || text.includes('confirm') || text.includes('correct') || text.includes('haan')) {
           handleFaceConfirmYes();
+          return;
         } else if (text.includes('no') || text.includes('not') || text.includes('nahin')) {
           handleFaceConfirmNo();
+          return;
         }
       } else if (screen === 'PHONE') {
         if (text.includes('clear') || text.includes('reset')) {
           setPhoneNumber('');
+          return;
         } else if (text.includes('back') || text.includes('delete')) {
           setPhoneNumber((prev) => prev.slice(0, -1));
+          return;
         } else if (text.includes('continue') || text.includes('send') || text.includes('next') || text.includes('code')) {
           handleSendOtp();
+          return;
         } else if (text.includes('face') || text.includes('camera')) {
           handleResetSession();
+          return;
         } else {
           const wordToNum: Record<string, string> = {
             zero: '0', one: '1', two: '2', three: '3', four: '4',
@@ -2556,13 +2906,16 @@ export const AvatarReceptionView: React.FC = () => {
           });
           if (digits) {
             setPhoneNumber((prev) => (prev + digits).slice(0, 15));
+            return;
           }
         }
       } else if (screen === 'OTP') {
         if (text.includes('clear') || text.includes('reset')) {
           setOtp('');
+          return;
         } else if (text.includes('back') || text.includes('delete')) {
           setOtp((prev) => prev.slice(0, -1));
+          return;
         } else {
           const wordToNum: Record<string, string> = {
             zero: '0', one: '1', two: '2', three: '3', four: '4',
@@ -2575,77 +2928,99 @@ export const AvatarReceptionView: React.FC = () => {
           });
           if (digits) {
             setOtp((prev) => (prev + digits).slice(0, 4));
+            return;
           }
         }
       } else if (screen === 'PATIENT_PICK') {
         const found = patients.find((p) => text.includes(p.name.toLowerCase()));
         if (found) {
           handleSelectFamilyPatient(found);
+          return;
         }
       } else if (screen === 'DETAILS_SUMMARY') {
         if (text.includes('confirm') || text.includes('check in') || text.includes('yes') || text.includes('print') || text.includes('done') || text.includes('token')) {
           handleConfirmCheckin();
+          return;
         } else if (text.includes('not me') || text.includes('cancel') || text.includes('no') || text.includes('back')) {
           handleResetSession();
+          return;
         }
       } else if (screen === 'ONBOARDING_DETAILS') {
         if (text.includes('next') || text.includes('continue') || text.includes('submit') || text.includes('review') || text.includes('face')) {
           handleOnboardingStep1Next();
+          return;
         } else if (!onboardingForm.name) {
           setOnboardingForm((prev) => ({ ...prev, name: rawTranscript.trim() }));
+          return;
         } else {
           setOnboardingForm((prev) => ({ ...prev, reason: rawTranscript.trim() }));
+          return;
         }
       } else if (screen === 'ONBOARDING_FACE') {
         if (faceRegPhase === 'intro') {
           if (text.includes('register') || text.includes('face') || text.includes('start') || text.includes('yes') || text.includes('camera')) {
             handleStartFaceRegistration();
+            return;
           } else if (text.includes('skip') || text.includes('no') || text.includes('later') || text.includes('cancel')) {
             handleSkipFaceRegistration();
+            return;
           }
         } else if (faceRegPhase === 'capturing') {
           if (text.includes('cancel') || text.includes('skip') || text.includes('stop')) {
             handleSkipFaceRegistration();
+            return;
           }
         } else if (faceRegPhase === 'duplicate_found') {
           if (text.includes('yes') || text.includes('me') || text.includes('confirm')) {
             handleDuplicateConfirmYes();
+            return;
           } else if (text.includes('no') || text.includes('new') || text.includes('continue')) {
             handleDuplicateConfirmNo();
+            return;
           }
         } else if (faceRegPhase === 'success') {
           if (text.includes('continue') || text.includes('review') || text.includes('next') || text.includes('done')) {
             handleContinueToReview();
+            return;
           }
         }
       } else if (screen === 'ONBOARDING_REVIEW') {
         if (text.includes('approve') || text.includes('confirm') || text.includes('yes') || text.includes('submit') || text.includes('done')) {
           handleOnboardingApprove();
+          return;
         } else if (text.includes('edit') || text.includes('change') || text.includes('back')) {
           setScreen('ONBOARDING_DETAILS');
+          return;
         } else if (text.includes('decline') || text.includes('cancel') || text.includes('no')) {
           handleResetSession();
+          return;
         }
       } else if (screen === 'SERVICE_DOCTOR') {
         if (text.includes('general') || text.includes('consultation') || text.includes('general consultation')) {
           setSelectedServiceId('srv_consult');
           setSelectedProviderId('next_available');
+          return;
         } else if (text.includes('cardio') || text.includes('heart') || text.includes('cardiology')) {
           setSelectedServiceId('srv_cardio');
           setSelectedProviderId('next_available');
+          return;
         } else if (text.includes('dental') || text.includes('tooth') || text.includes('teeth') || text.includes('clean')) {
           setSelectedServiceId('srv_dental');
           setSelectedProviderId('next_available');
+          return;
         } else if (text.includes('next available') || text.includes('first available') || text.includes('any')) {
           setSelectedProviderId('next_available');
+          return;
         } else if (text.includes('confirm') || text.includes('issue') || text.includes('ticket') || text.includes('book') || text.includes('done')) {
           if (selectedServiceId && selectedProviderId) {
             handleBookWalkIn();
           }
+          return;
         } else {
           const matchProv = providers.find((p) => text.includes(p.name.toLowerCase()));
           if (matchProv) {
             setSelectedProviderId(matchProv.id);
+            return;
           }
         }
       } else if (screen === 'TOKEN_ISSUED') {
@@ -2654,42 +3029,53 @@ export const AvatarReceptionView: React.FC = () => {
             maClient.sendTokenNotification(issuedTicket.id, phoneNumber || '+91 98765 43210', 'sms');
             showToast('Token details sent via SMS!');
           }
+          return;
         } else if (text.includes('done') || text.includes('finish') || text.includes('home') || text.includes('close')) {
           handleResetSession();
+          return;
         }
       } else if (screen === 'MY_VISIT') {
         if (text.includes('close') || text.includes('home') || text.includes('done') || text.includes('back')) {
           handleResetSession();
+          return;
         }
       } else if (screen === 'DIRECTIONS_CATEGORIES') {
         if (text.includes('back') || text.includes('home') || text.includes('cancel')) {
           handleResetSession();
+          return;
         } else {
           if (processDirectionsIntentRef.current) {
             processDirectionsIntentRef.current(rawTranscript);
+            return;
           }
         }
       } else if (screen === 'DIRECTIONS_ROOMS') {
         if (text.includes('back') || text.includes('categories') || text.includes('category')) {
           setScreen('DIRECTIONS_CATEGORIES');
+          return;
         } else if (text.includes('home') || text.includes('done')) {
           handleResetSession();
+          return;
         } else {
           if (processDirectionsIntentRef.current) {
             processDirectionsIntentRef.current(rawTranscript);
+            return;
           }
         }
       } else if (screen === 'DIRECTIONS_RESULT') {
         if (text.includes('done') || text.includes('finish') || text.includes('home') || text.includes('close')) {
           handleResetSession();
+          return;
         } else if (text.includes('back')) {
           handleDirectionsBack();
+          return;
         }
-      } else {
-        // Global intent trigger fallback
-        if (resolveIntentRef.current) {
-          resolveIntentRef.current(rawTranscript);
-        }
+      }
+
+      // 4. Global Conversational & Wayfinding Intent Fallback (Always executes if screen-specific logic did not match)
+      if (resolveIntentRef.current) {
+        console.log(`[Voice Assistant] 🧭 Routing to resolveIntent for "${rawTranscript}" from screen: ${screen}`);
+        await resolveIntentRef.current(rawTranscript, { isAmbient: false });
       }
     },
     [
@@ -2725,72 +3111,9 @@ export const AvatarReceptionView: React.FC = () => {
       showToast,
     ]
   );
+  handleVoiceCommandRef.current = handleVoiceCommand;
 
-  const startGlobalDictation = useCallback(() => {
-    if (typeof window === 'undefined') return;
-    const SpeechRecognitionClass =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionClass) return;
 
-    if (isListeningGlobal) {
-      if (globalRecognitionRef.current) {
-        try {
-          globalRecognitionRef.current.stop();
-        } catch {}
-      }
-      if (globalTimeoutRef.current) clearTimeout(globalTimeoutRef.current);
-      setIsListeningGlobal(false);
-      return;
-    }
-
-    if (globalRecognitionRef.current) {
-      try {
-        globalRecognitionRef.current.stop();
-      } catch {}
-    }
-    if (globalTimeoutRef.current) clearTimeout(globalTimeoutRef.current);
-
-    try {
-      const recognition = new SpeechRecognitionClass();
-      recognition.lang = currentLanguage === 'hi' ? 'hi-IN' : 'en-US';
-      recognition.continuous = false;
-      recognition.interimResults = false;
-
-      recognition.onstart = () => {
-        setIsListeningGlobal(true);
-      };
-
-      recognition.onresult = (event: any) => {
-        const transcript = event.results?.[0]?.[0]?.transcript || '';
-        if (transcript) {
-          handleVoiceCommand(transcript);
-          setHeardSuccessGlobal(true);
-          setTimeout(() => setHeardSuccessGlobal(false), 1500);
-        }
-        setIsListeningGlobal(false);
-      };
-
-      recognition.onerror = () => {
-        setIsListeningGlobal(false);
-      };
-
-      recognition.onend = () => {
-        setIsListeningGlobal(false);
-      };
-
-      globalRecognitionRef.current = recognition;
-      recognition.start();
-
-      globalTimeoutRef.current = setTimeout(() => {
-        try {
-          recognition.stop();
-        } catch {}
-        setIsListeningGlobal(false);
-      }, 10000);
-    } catch {
-      setIsListeningGlobal(false);
-    }
-  }, [isListeningGlobal, currentLanguage, handleVoiceCommand]);
 
   // Step Progress Calculation
   const getStepProgress = () => {
@@ -2920,16 +3243,7 @@ export const AvatarReceptionView: React.FC = () => {
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                handleUserActivity();
-                stopCameraStream();
-                setFlowType('SCHEDULED');
-                setScreen('FACE_SCAN');
-                navigate('/reception/appointment');
-                speak(
-                  currentLanguage === 'hi'
-                    ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
-                    : 'Please look into the camera to check in, or use your phone number below.'
-                );
+                enterAppointmentFlow();
               }}
               className="group flex flex-col items-center gap-2 cursor-pointer transition-all duration-300 active:scale-95 select-none"
             >
@@ -2943,31 +3257,31 @@ export const AvatarReceptionView: React.FC = () => {
               </span>
             </button>
 
-            {/* 2. Walk-in */}
+            {/* 2. Billing */}
             <button
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
                 handleUserActivity();
                 stopCameraStream();
-                setFlowType('WALK_IN');
+                setFlowType('PAYMENT');
                 setScreen('PHONE');
-                navigate('/reception/walk-in');
+                navigate('/reception/billing');
                 speak(
                   currentLanguage === 'hi'
-                    ? 'स्वागत है! पंजीकरण शुरू करने के लिए अपना फोन नंबर दर्ज करें।'
-                    : 'Welcome! Please enter your mobile phone number on the touch keypad to begin registration.'
+                    ? 'कृपया अपना बिल और बकाया देखने के लिए अपना मोबाइल नंबर दर्ज करें।'
+                    : 'Please enter your mobile phone number on the touch keypad to look up your bill.'
                 );
               }}
               className="group flex flex-col items-center gap-2 cursor-pointer transition-all duration-300 active:scale-95 select-none"
             >
               <div className="w-16 h-16 rounded-2xl bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20 hover:border-blue-400/60 shadow-[0_8px_24px_rgba(0,0,0,0.25)] hover:shadow-[0_12px_32px_rgba(20,86,240,0.40)] hover:scale-105 transition-all flex items-center justify-center text-white">
                 <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] flex items-center justify-center text-white shadow-md shadow-blue-500/30 group-hover:scale-110 transition-transform">
-                  <UserPlus className="w-5 h-5" />
+                  <CreditCard className="w-5 h-5" />
                 </div>
               </div>
               <span className="text-xs font-bold text-slate-200 group-hover:text-white transition-colors tracking-wide text-center">
-                {currentLanguage === 'hi' ? 'वॉक-इन' : 'Walk-in'}
+                {currentLanguage === 'hi' ? 'बिलिंग' : 'Billing'}
               </span>
             </button>
           </div>
@@ -2998,31 +3312,22 @@ export const AvatarReceptionView: React.FC = () => {
 
           {/* Right Symmetrical Quick Action Group (Desktop >= 1280px) */}
           <div className="hidden xl:flex flex-col items-center justify-center gap-8 shrink-0 z-20">
-            {/* 3. Pay Bill */}
+            {/* 3. Feedback */}
             <button
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                handleUserActivity();
-                stopCameraStream();
-                setFlowType('PAYMENT');
-                setScreen('PHONE');
-                navigate('/reception/billing');
-                speak(
-                  currentLanguage === 'hi'
-                    ? 'कृपया अपना बिल और बकाया देखने के लिए अपना मोबाइल नंबर दर्ज करें।'
-                    : 'Please enter your mobile phone number on the touch keypad to look up your bill.'
-                );
+                handleOpenFeedback();
               }}
               className="group flex flex-col items-center gap-2 cursor-pointer transition-all duration-300 active:scale-95 select-none"
             >
               <div className="w-16 h-16 rounded-2xl bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20 hover:border-blue-400/60 shadow-[0_8px_24px_rgba(0,0,0,0.25)] hover:shadow-[0_12px_32px_rgba(20,86,240,0.40)] hover:scale-105 transition-all flex items-center justify-center text-white">
                 <div className="w-10 h-10 rounded-xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] flex items-center justify-center text-white shadow-md shadow-blue-500/30 group-hover:scale-110 transition-transform">
-                  <CreditCard className="w-5 h-5" />
+                  <MessageSquare className="w-5 h-5" />
                 </div>
               </div>
               <span className="text-xs font-bold text-slate-200 group-hover:text-white transition-colors tracking-wide text-center">
-                {currentLanguage === 'hi' ? 'बिल भुगतान' : 'Pay Bill'}
+                {currentLanguage === 'hi' ? 'प्रतिक्रिया' : 'Feedback'}
               </span>
             </button>
 
@@ -3053,16 +3358,7 @@ export const AvatarReceptionView: React.FC = () => {
               type="button"
               onClick={(e) => {
                 e.stopPropagation();
-                handleUserActivity();
-                stopCameraStream();
-                setFlowType('SCHEDULED');
-                setScreen('FACE_SCAN');
-                navigate('/reception/appointment');
-                speak(
-                  currentLanguage === 'hi'
-                    ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
-                    : 'Please look into the camera to check in, or use your phone number below.'
-                );
+                enterAppointmentFlow();
               }}
               className="group flex flex-col items-center gap-1.5 cursor-pointer active:scale-95"
             >
@@ -3076,35 +3372,7 @@ export const AvatarReceptionView: React.FC = () => {
               </span>
             </button>
 
-            {/* 2. Walk-in */}
-            <button
-              type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                handleUserActivity();
-                stopCameraStream();
-                setFlowType('WALK_IN');
-                setScreen('PHONE');
-                navigate('/reception/walk-in');
-                speak(
-                  currentLanguage === 'hi'
-                    ? 'स्वागत है! पंजीकरण शुरू करने के लिए अपना फोन नंबर दर्ज करें।'
-                    : 'Welcome! Please enter your mobile phone number on the touch keypad to begin registration.'
-                );
-              }}
-              className="group flex flex-col items-center gap-1.5 cursor-pointer active:scale-95"
-            >
-              <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20 shadow-lg flex items-center justify-center text-white">
-                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] flex items-center justify-center text-white">
-                  <UserPlus className="w-4 h-4 sm:w-5 sm:h-5" />
-                </div>
-              </div>
-              <span className="text-[11px] sm:text-xs font-bold text-slate-200">
-                {currentLanguage === 'hi' ? 'वॉक-इन' : 'Walk-in'}
-              </span>
-            </button>
-
-            {/* 3. Pay Bill */}
+            {/* 2. Billing */}
             <button
               type="button"
               onClick={(e) => {
@@ -3128,7 +3396,26 @@ export const AvatarReceptionView: React.FC = () => {
                 </div>
               </div>
               <span className="text-[11px] sm:text-xs font-bold text-slate-200">
-                {currentLanguage === 'hi' ? 'बिल भुगतान' : 'Pay Bill'}
+                {currentLanguage === 'hi' ? 'बिलिंग' : 'Billing'}
+              </span>
+            </button>
+
+            {/* 3. Feedback */}
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleOpenFeedback();
+              }}
+              className="group flex flex-col items-center gap-1.5 cursor-pointer active:scale-95"
+            >
+              <div className="w-14 h-14 sm:w-16 sm:h-16 rounded-2xl bg-white/10 hover:bg-white/20 backdrop-blur-xl border border-white/20 shadow-lg flex items-center justify-center text-white">
+                <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] flex items-center justify-center text-white">
+                  <MessageSquare className="w-4 h-4 sm:w-5 sm:h-5" />
+                </div>
+              </div>
+              <span className="text-[11px] sm:text-xs font-bold text-slate-200">
+                {currentLanguage === 'hi' ? 'प्रतिक्रिया' : 'Feedback'}
               </span>
             </button>
 
@@ -3305,15 +3592,17 @@ export const AvatarReceptionView: React.FC = () => {
               <div className="flex items-center justify-between mb-0.5">
                 <p className="text-xs font-semibold uppercase tracking-wider text-slate-400">
                   {isUserSpeaking
-                    ? 'You are speaking...'
+                    ? currentLanguage === 'hi' ? 'आप बोल रहे हैं...' : 'You are speaking...'
                     : userTranscriptText && avatarState !== 'speaking'
-                    ? 'You said'
+                    ? currentLanguage === 'hi' ? 'आपने कहा' : 'You said'
                     : avatarState === 'thinking'
                     ? thinkingMessage
-                    : 'Aria Speaking'}
+                    : avatarState === 'speaking'
+                    ? currentLanguage === 'hi' ? 'एरिया बोल रही हैं' : 'Aria Speaking'
+                    : currentLanguage === 'hi' ? 'सुन रहे हैं...' : 'Listening...'}
                 </p>
                 {/* CSS Animated Voice Waveform Bars */}
-                {(avatarState === 'speaking' || isUserSpeaking) && (
+                {(avatarState === 'speaking' || isUserSpeaking || avatarState === 'idle') && (
                   <div className="flex items-center gap-1 h-3.5">
                     {[0, 1, 2, 3, 4, 5, 6, 7].map((i) => (
                       <span
@@ -3384,6 +3673,12 @@ export const AvatarReceptionView: React.FC = () => {
                     <span>Directions & Location</span>
                   </>
                 )}
+                {screen === 'COMING_SOON' && (
+                  <>
+                    <MessageSquare className="w-5 h-5 text-[#1456f0]" />
+                    <span>Patient Feedback</span>
+                  </>
+                )}
               </h2>
               <p className="text-sm text-[#64748b] mt-0.5">
                 {(screen === 'FACE_SCAN' || screen === 'VERIFY_CHOICE' || screen === 'FACE_CONSENT') &&
@@ -3404,6 +3699,7 @@ export const AvatarReceptionView: React.FC = () => {
                 {screen === 'DIRECTIONS_CATEGORIES' && 'Select a department to view available rooms and directions.'}
                 {screen === 'DIRECTIONS_ROOMS' && 'Select a room or station to view walking directions.'}
                 {screen === 'DIRECTIONS_RESULT' && 'Step-by-step navigation from reception.'}
+                {screen === 'COMING_SOON' && 'This feature is currently under development.'}
               </p>
             </div>
 
@@ -3465,19 +3761,9 @@ export const AvatarReceptionView: React.FC = () => {
 
             {/* Four Large Clinical Glass Quick Action Cards */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-2 xl:grid-cols-4 gap-4 lg:gap-5 my-auto py-2">
-              {/* 1. I Have an Appointment */}
+              {/* 1. Appointment (Unified Entry per PRD Section 3.1 & Global Principle 2) */}
               <button
-                onClick={() => {
-                  handleUserActivity();
-                  setFlowType('SCHEDULED');
-                  setScreen('FACE_SCAN');
-                  navigate('/reception/appointment');
-                  speak(
-                    currentLanguage === 'hi'
-                      ? 'कृपया चेक इन करने के लिए कैमरे में देखें या फोन नंबर दर्ज करें।'
-                      : 'Please look into the camera to check in, or use your phone number below.'
-                  );
-                }}
+                onClick={enterAppointmentFlow}
                 className="group text-left p-5 lg:p-6 rounded-3xl bg-gradient-to-br from-white/90 via-white/75 to-blue-50/60 hover:from-white hover:to-blue-50/90 backdrop-blur-xl border-2 border-blue-200 hover:border-[#1456f0] shadow-[0_12px_32px_rgba(20,86,240,0.12)] hover:shadow-[0_18px_44px_rgba(20,86,240,0.22)] hover:-translate-y-1 active:translate-y-0 transition-all duration-300 cursor-pointer flex flex-col justify-between relative overflow-hidden min-h-[var(--touch,60px)]"
               >
                 <div className="absolute top-0 right-0 w-28 h-28 bg-blue-500/10 rounded-full blur-2xl group-hover:scale-125 transition-transform duration-500 -mr-6 -mt-6" />
@@ -3488,66 +3774,25 @@ export const AvatarReceptionView: React.FC = () => {
                       <CalendarCheck className="w-6 h-6" />
                     </div>
                     <span className="px-2.5 py-0.5 rounded-full bg-blue-100/80 text-blue-800 text-[11px] font-bold tracking-wide uppercase border border-blue-200/60">
-                      Scheduled
+                      Appointment
                     </span>
                   </div>
 
                   <h3 className="text-lg lg:text-xl font-bold text-[#181e25] font-display group-hover:text-[#1456f0] transition-colors">
-                    I Have an Appointment
+                    Appointment & Check-in
                   </h3>
                   <p className="text-xs sm:text-sm text-[#64748b] mt-1.5 leading-relaxed line-clamp-2">
-                    Instant face recognition or phone lookup for pre-booked visits.
+                    Instant face recognition check-in or walk-in consultation.
                   </p>
                 </div>
 
                 <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100 text-xs sm:text-sm font-bold text-[#1456f0] group-hover:translate-x-1 transition-transform">
-                  <span>Touch to Check In</span>
+                  <span>Touch to Start</span>
                   <ArrowRight className="w-4 h-4" />
                 </div>
               </button>
 
-              {/* 2. I'm a Walk-in Patient */}
-              <button
-                onClick={() => {
-                  handleUserActivity();
-                  setFlowType('WALK_IN');
-                  setScreen('PHONE');
-                  navigate('/reception/walk-in');
-                  speak(
-                    currentLanguage === 'hi'
-                      ? 'स्वागत है! पंजीकरण शुरू करने के लिए अपना फोन नंबर दर्ज करें।'
-                      : 'Welcome! Please enter your mobile phone number on the touch keypad to begin registration.'
-                  );
-                }}
-                className="group text-left p-5 lg:p-6 rounded-3xl bg-gradient-to-br from-white/90 via-white/75 to-blue-50/60 hover:from-white hover:to-blue-50/90 backdrop-blur-xl border-2 border-blue-200 hover:border-[#1456f0] shadow-[0_12px_32px_rgba(20,86,240,0.12)] hover:shadow-[0_18px_44px_rgba(20,86,240,0.22)] hover:-translate-y-1 active:translate-y-0 transition-all duration-300 cursor-pointer flex flex-col justify-between relative overflow-hidden min-h-[var(--touch,60px)]"
-              >
-                <div className="absolute top-0 right-0 w-28 h-28 bg-blue-500/10 rounded-full blur-2xl group-hover:scale-125 transition-transform duration-500 -mr-6 -mt-6" />
-
-                <div>
-                  <div className="flex items-center justify-between mb-3">
-                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] text-white flex items-center justify-center shadow-lg shadow-blue-500/30 group-hover:scale-110 transition-transform duration-300">
-                      <UserPlus className="w-6 h-6" />
-                    </div>
-                    <span className="px-2.5 py-0.5 rounded-full bg-blue-100/80 text-blue-800 text-[11px] font-bold tracking-wide uppercase border border-blue-200/60">
-                      Walk-in
-                    </span>
-                  </div>
-
-                  <h3 className="text-lg lg:text-xl font-bold text-[#181e25] font-display group-hover:text-[#1456f0] transition-colors">
-                    I'm a Walk-in Patient
-                  </h3>
-                  <p className="text-xs sm:text-sm text-[#64748b] mt-1.5 leading-relaxed line-clamp-2">
-                    Register without an appointment, pick your doctor, and get a token.
-                  </p>
-                </div>
-
-                <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100 text-xs sm:text-sm font-bold text-[#1456f0] group-hover:translate-x-1 transition-transform">
-                  <span>Start Registration</span>
-                  <ArrowRight className="w-4 h-4" />
-                </div>
-              </button>
-
-              {/* 3. Pay My Bill */}
+              {/* 2. Billing */}
               <button
                 onClick={() => {
                   handleUserActivity();
@@ -3575,7 +3820,7 @@ export const AvatarReceptionView: React.FC = () => {
                   </div>
 
                   <h3 className="text-lg lg:text-xl font-bold text-[#181e25] font-display group-hover:text-[#1456f0] transition-colors">
-                    Pay My Bill
+                    Billing & Invoices
                   </h3>
                   <p className="text-xs sm:text-sm text-[#64748b] mt-1.5 leading-relaxed line-clamp-2">
                     Quick payment lookup, invoice settlement, and digital receipts.
@@ -3584,6 +3829,37 @@ export const AvatarReceptionView: React.FC = () => {
 
                 <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100 text-xs sm:text-sm font-bold text-[#1456f0] group-hover:translate-x-1 transition-transform">
                   <span>Pay or View Dues</span>
+                  <ArrowRight className="w-4 h-4" />
+                </div>
+              </button>
+
+              {/* 3. Patient Feedback */}
+              <button
+                onClick={handleOpenFeedback}
+                className="group text-left p-5 lg:p-6 rounded-3xl bg-gradient-to-br from-white/90 via-white/75 to-blue-50/60 hover:from-white hover:to-blue-50/90 backdrop-blur-xl border-2 border-blue-200 hover:border-[#1456f0] shadow-[0_12px_32px_rgba(20,86,240,0.12)] hover:shadow-[0_18px_44px_rgba(20,86,240,0.22)] hover:-translate-y-1 active:translate-y-0 transition-all duration-300 cursor-pointer flex flex-col justify-between relative overflow-hidden min-h-[var(--touch,60px)]"
+              >
+                <div className="absolute top-0 right-0 w-28 h-28 bg-blue-500/10 rounded-full blur-2xl group-hover:scale-125 transition-transform duration-500 -mr-6 -mt-6" />
+
+                <div>
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-[#1456f0] to-[#2563eb] text-white flex items-center justify-center shadow-lg shadow-blue-500/30 group-hover:scale-110 transition-transform duration-300">
+                      <MessageSquare className="w-6 h-6" />
+                    </div>
+                    <span className="px-2.5 py-0.5 rounded-full bg-blue-100/80 text-blue-800 text-[11px] font-bold tracking-wide uppercase border border-blue-200/60">
+                      Feedback
+                    </span>
+                  </div>
+
+                  <h3 className="text-lg lg:text-xl font-bold text-[#181e25] font-display group-hover:text-[#1456f0] transition-colors">
+                    Patient Feedback
+                  </h3>
+                  <p className="text-xs sm:text-sm text-[#64748b] mt-1.5 leading-relaxed line-clamp-2">
+                    Share your clinic visit experience and ratings (Coming Soon).
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-1.5 mt-4 pt-3 border-t border-slate-100 text-xs sm:text-sm font-bold text-[#1456f0] group-hover:translate-x-1 transition-transform">
+                  <span>Give Feedback</span>
                   <ArrowRight className="w-4 h-4" />
                 </div>
               </button>
@@ -4183,7 +4459,7 @@ export const AvatarReceptionView: React.FC = () => {
                     onFocus={() => { activeFocusedFieldRef.current = 'name'; }}
                     onBlur={() => { activeFocusedFieldRef.current = null; }}
                     onChange={(e) => setOnboardingForm({ ...onboardingForm, name: e.target.value })}
-                    placeholder="e.g. Sunita Rao"
+                    placeholder="e.g. Priya Sharma"
                     className="w-full h-14 px-4.5 pr-14 rounded-2xl border-2 border-slate-200/85 bg-white text-lg font-medium text-slate-900 placeholder:text-slate-400 focus:border-[#1456f0] focus:ring-4 focus:ring-blue-500/10 outline-none transition-all"
                   />
                   {isSpeechRecognitionSupported && (
@@ -4772,57 +5048,23 @@ export const AvatarReceptionView: React.FC = () => {
         )}
 
         {/* ===================================================================== */}
-        {/* TOKEN ISSUED SCREEN                                                   */}
+        {/* TOKEN ISSUED SCREEN (Shared Component per PRD Section 3.2)            */}
         {/* ===================================================================== */}
         {screen === 'TOKEN_ISSUED' && issuedTicket && (
-          <div className="flex-1 flex flex-col justify-center items-center py-2 text-center max-w-md mx-auto w-full">
-            <div className="w-full bg-white rounded-3xl border-2 border-emerald-300 p-6 shadow-xl space-y-4">
-              <div className="w-16 h-16 rounded-full bg-emerald-50 text-emerald-600 border border-emerald-200 flex items-center justify-center mx-auto">
-                <Ticket className="w-8 h-8" />
-              </div>
-
-              <div>
-                <span className="text-xs font-bold uppercase tracking-wider text-emerald-700 bg-emerald-50 px-3 py-1 rounded-full border border-emerald-200">
-                  Visit Token Confirmed
-                </span>
-                <div className="text-4xl lg:text-5xl font-extrabold text-slate-900 font-mono tracking-tight my-2">
-                  {issuedTicket.tokenLabel}
-                </div>
-                <p className="text-base font-bold text-slate-800 font-display">
-                  {issuedTicket.stationName}
-                </p>
-                <p className="text-sm text-slate-500">
-                  Estimated Wait: ~{issuedTicket.estimatedWaitMin || 8} min
-                </p>
-              </div>
-
-              <div className="p-3.5 bg-slate-50 rounded-2xl border border-slate-200 text-sm text-slate-600 text-left space-y-1.5">
-                <p className="font-semibold text-slate-800">What to do next:</p>
-                <p>1. Please take a seat in the waiting lobby.</p>
-                <p>2. We'll call your token number. Please take a seat in the waiting area.</p>
-                <p>3. Proceed to the doctor's room when called.</p>
-              </div>
-
-              <div className="flex items-center gap-2 pt-2">
-                <button
-                  onClick={() => {
-                    maClient.sendTokenNotification(issuedTicket.id, phoneNumber || '+91 98765 43210', 'sms');
-                    showToast('Token details sent via SMS!');
-                  }}
-                  className="flex-1 py-3.5 rounded-full bg-slate-900 hover:bg-[#181e25] text-white text-sm font-bold flex items-center justify-center gap-1.5 cursor-pointer shadow-xs min-h-[var(--touch,60px)]"
-                >
-                  <Send className="w-4 h-4 text-blue-400" />
-                  <span>Send SMS Pass</span>
-                </button>
-                <button
-                  onClick={handleResetSession}
-                  className="px-6 py-3.5 rounded-full bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold cursor-pointer shadow-xs min-h-[var(--touch,60px)]"
-                >
-                  Done
-                </button>
-              </div>
-            </div>
-          </div>
+          <TokenAndCurrentServingCard
+            issuedTicket={issuedTicket}
+            patient={selectedPatient}
+            visitSummary={visitSummary}
+            currentLanguage={currentLanguage}
+            onReset={() => handleResetSession()}
+            onSendSms={(phone) => {
+              maClient.sendTokenNotification(issuedTicket.id, phone, 'sms');
+              showToast('Token pass details sent via SMS!');
+            }}
+            onViewDirections={(_stationId) => {
+              handleOpenDirections();
+            }}
+          />
         )}
 
         {/* ===================================================================== */}
@@ -5085,43 +5327,35 @@ export const AvatarReceptionView: React.FC = () => {
         )}
 
         {/* ===================================================================== */}
-        {/* GLOBAL FLOATING MIC ASSISTANT BUTTON                                  */}
+        {/* COMING SOON PLACEHOLDER (e.g. Feedback, PRD Section 5)                */}
         {/* ===================================================================== */}
-        {screen !== 'IDLE' && isSpeechRecognitionSupported && (
-          <div className="absolute bottom-5 right-5 z-40 pointer-events-auto">
-            <button
-              onClick={startGlobalDictation}
-              title={
-                isListeningGlobal
-                  ? 'Listening... Speak a command or dictation'
-                  : 'Tap to speak / voice control'
-              }
-              className={`w-13 h-13 rounded-full flex items-center justify-center transition-all duration-300 cursor-pointer shadow-lg active:scale-95 group relative ${
-                isListeningGlobal
-                  ? 'bg-gradient-to-br from-[#1456f0] to-[#2563eb] text-white ring-4 ring-blue-400/40 shadow-blue-500/30 scale-105 animate-pulse'
-                  : heardSuccessGlobal
-                  ? 'bg-emerald-600 text-white ring-4 ring-emerald-400/40 shadow-emerald-500/30'
-                  : 'bg-white/90 hover:bg-white text-slate-600 hover:text-[#1456f0] border-2 border-slate-200/90 hover:border-blue-300 shadow-[0_8px_20px_rgba(24,30,37,0.12)]'
-              }`}
-            >
-              {isListeningGlobal ? (
-                <div className="flex items-center gap-0.5">
-                  <Mic className="w-5 h-5" />
-                  <span className="w-1 h-3 bg-white rounded-full animate-bounce" />
-                  <span className="w-1 h-4 bg-white rounded-full animate-bounce [animation-delay:0.15s]" />
-                  <span className="w-1 h-2 bg-white rounded-full animate-bounce [animation-delay:0.3s]" />
-                </div>
-              ) : heardSuccessGlobal ? (
-                <CheckCircle2 className="w-6 h-6 text-white" />
-              ) : (
-                <Mic className="w-5 h-5 group-hover:scale-110 transition-transform" />
-              )}
-
-              {/* Floating Tooltip Pill */}
-              <span className="absolute bottom-full right-0 mb-2 px-3 py-1 bg-slate-900/90 backdrop-blur-md text-white text-xs font-semibold rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-all duration-200 translate-y-1 group-hover:translate-y-0 whitespace-nowrap z-50">
-                {isListeningGlobal ? 'Listening... Speak command' : 'Voice Assistant'}
+        {screen === 'COMING_SOON' && (
+          <div className="flex-1 w-full h-full flex flex-col justify-between py-2 min-h-0 animate-in fade-in duration-300">
+            <div className="flex-1 flex flex-col items-center justify-center text-center p-6 sm:p-8">
+              <div className="w-20 h-20 rounded-3xl bg-gradient-to-br from-blue-50 to-indigo-50 border-2 border-blue-200 text-[#1456f0] flex items-center justify-center mb-6 shadow-xl shadow-blue-500/10">
+                <Sparkles className="w-10 h-10 animate-pulse text-[#1456f0]" />
+              </div>
+              <span className="px-3 py-1 rounded-full bg-blue-100 text-blue-800 text-xs font-bold uppercase tracking-wider mb-3 border border-blue-200">
+                Under Development
               </span>
-            </button>
+              <h3 className="text-2xl sm:text-3xl font-extrabold text-[#181e25] mb-3 font-display">
+                Feature Coming Soon
+              </h3>
+              <p className="text-base sm:text-lg text-[#64748b] max-w-md leading-relaxed">
+                Patient satisfaction ratings and clinic experience feedback are currently being integrated and will be available in an upcoming update.
+              </p>
+            </div>
+
+            {/* Bottom Back Button */}
+            <div className="pt-3 shrink-0">
+              <button
+                onClick={handleResetSession}
+                className="w-full h-14 rounded-full bg-gradient-to-r from-[#1456f0] to-[#2563eb] hover:from-[#1146c7] hover:to-[#1d4ed8] text-white text-base font-bold transition-all cursor-pointer flex items-center justify-center gap-2 shadow-lg shadow-blue-500/25 active:scale-[0.99]"
+              >
+                <ArrowLeft className="w-5 h-5" />
+                <span>Back to Home</span>
+              </button>
+            </div>
           </div>
         )}
       </main>
@@ -5148,7 +5382,7 @@ export const AvatarReceptionView: React.FC = () => {
             </span>
           </button>
 
-          {/* Check-in Button */}
+          {/* Appointment Button */}
           <button
             onClick={() => handleNavClick('checkin')}
             className={`w-12 h-12 lg:w-13 lg:h-13 rounded-full flex flex-col items-center justify-center transition-all duration-300 cursor-pointer relative group ${
@@ -5156,31 +5390,15 @@ export const AvatarReceptionView: React.FC = () => {
                 ? 'bg-gradient-to-br from-[#181e25] to-[#2c3e50] text-white shadow-[0_10px_25px_rgba(24,30,37,0.30)] ring-2 ring-blue-500/50 scale-105'
                 : 'bg-white/80 hover:bg-white backdrop-blur-xl shadow-[0_8px_20px_rgba(24,30,37,0.08)] hover:shadow-[0_12px_28px_rgba(20,86,240,0.18)] hover:scale-108 active:scale-95 text-[#45515e] hover:text-[#181e25]'
             }`}
-            title="Check-in"
+            title="Appointment"
           >
             <CalendarCheck className={`w-5 h-5 ${flowType === 'SCHEDULED' && screen !== 'IDLE' ? 'text-[#60a5fa]' : 'text-[#64748b] group-hover:text-blue-600'}`} />
             <span className="absolute right-14 lg:right-[60px] px-2.5 py-1 bg-slate-900/90 backdrop-blur-md text-white text-xs font-semibold rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-all duration-200 translate-x-1 group-hover:translate-x-0 whitespace-nowrap z-50">
-              Check-in
+              Appointment
             </span>
           </button>
 
-          {/* New Patient Button */}
-          <button
-            onClick={() => handleNavClick('new_patient')}
-            className={`w-12 h-12 lg:w-13 lg:h-13 rounded-full flex flex-col items-center justify-center transition-all duration-300 cursor-pointer relative group ${
-              flowType === 'WALK_IN'
-                ? 'bg-gradient-to-br from-[#181e25] to-[#2c3e50] text-white shadow-[0_10px_25px_rgba(24,30,37,0.30)] ring-2 ring-blue-500/50 scale-105'
-                : 'bg-white/80 hover:bg-white backdrop-blur-xl shadow-[0_8px_20px_rgba(24,30,37,0.08)] hover:shadow-[0_12px_28px_rgba(20,86,240,0.18)] hover:scale-108 active:scale-95 text-[#45515e] hover:text-[#181e25]'
-            }`}
-            title="New Patient"
-          >
-            <UserPlus className={`w-5 h-5 ${flowType === 'WALK_IN' ? 'text-[#60a5fa]' : 'text-[#64748b] group-hover:text-blue-600'}`} />
-            <span className="absolute right-14 lg:right-[60px] px-2.5 py-1 bg-slate-900/90 backdrop-blur-md text-white text-xs font-semibold rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-all duration-200 translate-x-1 group-hover:translate-x-0 whitespace-nowrap z-50">
-              New Patient
-            </span>
-          </button>
-
-          {/* Pay Bill Button */}
+          {/* Billing Button */}
           <button
             onClick={() => handleNavClick('payment')}
             className={`w-12 h-12 lg:w-13 lg:h-13 rounded-full flex flex-col items-center justify-center transition-all duration-300 cursor-pointer relative group ${
@@ -5188,11 +5406,27 @@ export const AvatarReceptionView: React.FC = () => {
                 ? 'bg-gradient-to-br from-[#181e25] to-[#2c3e50] text-white shadow-[0_10px_25px_rgba(24,30,37,0.30)] ring-2 ring-blue-500/50 scale-105'
                 : 'bg-white/80 hover:bg-white backdrop-blur-xl shadow-[0_8px_20px_rgba(24,30,37,0.08)] hover:shadow-[0_12px_28px_rgba(20,86,240,0.18)] hover:scale-108 active:scale-95 text-[#45515e] hover:text-[#181e25]'
             }`}
-            title="Pay Bill"
+            title="Billing"
           >
             <CreditCard className={`w-5 h-5 ${flowType === 'PAYMENT' && screen !== 'IDLE' ? 'text-[#60a5fa]' : 'text-[#64748b] group-hover:text-blue-600'}`} />
             <span className="absolute right-14 lg:right-[60px] px-2.5 py-1 bg-slate-900/90 backdrop-blur-md text-white text-xs font-semibold rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-all duration-200 translate-x-1 group-hover:translate-x-0 whitespace-nowrap z-50">
-              Pay Bill
+              Billing
+            </span>
+          </button>
+
+          {/* Feedback Button */}
+          <button
+            onClick={() => handleNavClick('feedback')}
+            className={`w-12 h-12 lg:w-13 lg:h-13 rounded-full flex flex-col items-center justify-center transition-all duration-300 cursor-pointer relative group ${
+              screen === 'COMING_SOON'
+                ? 'bg-gradient-to-br from-[#181e25] to-[#2c3e50] text-white shadow-[0_10px_25px_rgba(24,30,37,0.30)] ring-2 ring-blue-500/50 scale-105'
+                : 'bg-white/80 hover:bg-white backdrop-blur-xl shadow-[0_8px_20px_rgba(24,30,37,0.08)] hover:shadow-[0_12px_28px_rgba(20,86,240,0.18)] hover:scale-108 active:scale-95 text-[#45515e] hover:text-[#181e25]'
+            }`}
+            title="Feedback"
+          >
+            <MessageSquare className={`w-5 h-5 ${screen === 'COMING_SOON' ? 'text-[#60a5fa]' : 'text-[#64748b] group-hover:text-blue-600'}`} />
+            <span className="absolute right-14 lg:right-[60px] px-2.5 py-1 bg-slate-900/90 backdrop-blur-md text-white text-xs font-semibold rounded-lg shadow-xl opacity-0 group-hover:opacity-100 pointer-events-none transition-all duration-200 translate-x-1 group-hover:translate-x-0 whitespace-nowrap z-50">
+              Feedback
             </span>
           </button>
 
